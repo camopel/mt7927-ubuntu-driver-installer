@@ -75,10 +75,21 @@ Step by step, `install.sh`:
 6. `sudo dpkg -i` the freshly built `.deb`. DKMS builds the modules for every
    installed kernel and registers `dkms autoinstall` so **future kernel
    upgrades rebuild automatically**.
-7. Verifies: `dkms status`, PCI/USB detection, installed modules, firmware
+7. **Installs WiFi firmware if missing.** Upstream only ships the Bluetooth
+   blob and expects WiFi firmware from `linux-firmware`; if your
+   `linux-firmware` predates it, the WiFi blobs are extracted from the ASUS
+   zip into `/usr/lib/firmware/mediatek/mt7927/`. Skipped when already
+   present, so a newer `linux-firmware` copy is never shadowed.
+8. **Secure Boot:** if enabled and the DKMS signing key
+   (`/var/lib/shim-signed/mok/MOK.der`) isn't enrolled yet, runs
+   `mokutil --import` and asks you for a one-time password. On the next boot,
+   the blue MokManager screen appears: choose **Enroll MOK → Continue → Yes**
+   and enter that password. Without this the kernel refuses to load the
+   modules.
+9. Verifies: `dkms status`, PCI/USB detection, installed modules, firmware
    files on disk.
-8. Prints reboot instructions (see *Known issues* below for why live module
-   reload is avoided).
+10. Prints reboot instructions (see *Known issues* below for why live module
+    reload is avoided).
 
 All output is also saved to `install-YYYYMMDD-HHMMSS.log`.
 
@@ -95,7 +106,7 @@ All output is also saved to `install-YYYYMMDD-HHMMSS.log`.
 ### First-time install
 
 ```bash
-git clone https://github.com/camopel/mt7927-ubuntu-installer.git ~/Workspace/drivers/mt7927
+git clone https://github.com/camopel/mt7927-ubuntu-driver-installer.git ~/Workspace/drivers/mt7927
 cd ~/Workspace/drivers/mt7927
 ./install.sh
 sudo reboot
@@ -146,7 +157,9 @@ sudo ./uninstall.sh
 # equivalent to: sudo dpkg -r mediatek-mt7927-dkms
 ```
 
-This removes the DKMS source, compiled modules, and firmware blobs cleanly.
+This removes the DKMS source, compiled modules, and firmware blobs cleanly,
+including WiFi firmware the installer extracted itself (files owned by
+`linux-firmware` are left alone).
 
 ---
 
