@@ -106,7 +106,7 @@ All output is also saved to `install-YYYYMMDD-HHMMSS.log`.
 ### First-time install
 
 ```bash
-git clone https://github.com/camopel/mt7927-ubuntu-installer.git ~/Workspace/drivers/mt7927
+git clone https://github.com/camopel/mt7927-ubuntu-driver-installer.git ~/Workspace/drivers/mt7927
 cd ~/Workspace/drivers/mt7927
 ./install.sh
 sudo reboot
