@@ -10,7 +10,9 @@
 #    4. Build fresh .deb (never reuses stale artifacts)
 #    5. Archive .deb to ./archive/ with timestamp
 #    6. dpkg -i → DKMS auto-builds modules for running + installed kernels
-#    7. Verify, print status + reboot hint
+#    7. Install WiFi firmware from vendor ZIP if linux-firmware lacks it
+#    8. Secure Boot: queue DKMS signing key (MOK) for enrollment on next boot
+#    9. Verify, print status + reboot hint
 #
 #  All source/build/archive stays under this directory.
 #  Installed files go to standard system paths (required for the kernel
@@ -18,7 +20,7 @@
 #      /usr/src/mediatek-mt7927-<ver>/
 #      /lib/modules/$(uname -r)/updates/dkms/*.ko
 #      /usr/lib/firmware/mediatek/
-#  Clean removal:  sudo dpkg -r mediatek-mt7927-dkms
+#  Clean removal:  ./uninstall.sh
 # ============================================================================
 
 set -Eeuo pipefail
@@ -98,6 +100,11 @@ check_kernel() {
 
 # ── steps ──────────────────────────────────────────────────────────────────
 apt_refresh() {
+    # Finish any interrupted dpkg run (e.g. a killed previous install), or apt refuses to work.
+    if [[ -n "$($SUDO dpkg --audit 2>/dev/null)" ]]; then
+        log "Finishing interrupted dpkg run…"
+        $SUDO env DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 | tee -a "$LOG" | tail -10
+    fi
     log "apt-get update…"
     $SUDO apt-get update -qq
 }
@@ -129,17 +136,17 @@ upgrade_kernel() {
     fi
 
     log "Installing/upgrading: ${to_install[*]}"
-    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y "${to_install[@]}" \
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "${to_install[@]}" \
         | tee -a "$LOG" | tail -20
     # Ensure headers for the currently running kernel are present (needed now for DKMS build)
-    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y "linux-headers-$(uname -r)" 2>&1 \
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$(uname -r)" 2>&1 \
         | tee -a "$LOG" | tail -5 || warn "linux-headers-$(uname -r) not available — DKMS may fail."
     ok "Kernel upgrade step complete."
 }
 
 install_build_deps() {
     log "Installing build dependencies…"
-    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y \
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
         dkms make gcc python3 curl git dpkg-dev debhelper build-essential \
         | tee -a "$LOG" | tail -5
     ok "Build deps ready."
@@ -183,11 +190,60 @@ install_deb() {
     local deb
     deb=$(cat "$SCRIPT_DIR/.last-deb")
     log "Installing $deb (DKMS will build for all installed kernels)…"
-    DEBIAN_FRONTEND=noninteractive $SUDO dpkg -i "$deb" 2>&1 | tee -a "$LOG" | tail -30 || {
+    $SUDO env DEBIAN_FRONTEND=noninteractive dpkg -i "$deb" 2>&1 | tee -a "$LOG" | tail -30 || {
         warn "dpkg reported an issue — attempting apt-get -f install to fix deps…"
         $SUDO apt-get -y -f install 2>&1 | tee -a "$LOG" | tail -10
     }
     ok "Package installed."
+}
+
+# Since upstream v2.14-4 the package ships only the BT blob and expects WiFi
+# firmware from linux-firmware. Older linux-firmware lacks it, so fall back to
+# extracting it from the vendor ZIP — only when missing, so a newer
+# linux-firmware copy is never shadowed.
+install_wifi_fw() {
+    local fwdir=/usr/lib/firmware/mediatek/mt7927 f missing=0
+    for f in WIFI_MT6639_PATCH_MCU_2_1_hdr.bin WIFI_RAM_CODE_MT6639_2_1.bin; do
+        compgen -G "$fwdir/$f*" >/dev/null || missing=1
+    done
+    if (( ! missing )); then
+        ok "WiFi firmware present (linux-firmware)."; return
+    fi
+    local zip tmp
+    zip=$(ls -1 "$SRC_DIR"/DRV_WiFi_MTK_*.zip 2>/dev/null | head -1)
+    if [[ -z "$zip" ]]; then
+        warn "WiFi firmware missing and no vendor ZIP in $SRC_DIR — WiFi will not come up."; return
+    fi
+    log "linux-firmware lacks MT7927 WiFi firmware — extracting from $(basename "$zip")…"
+    tmp=$(mktemp -d)
+    python3 "$SRC_DIR/extract_firmware.py" "$zip" "$tmp" 2>&1 | tee -a "$LOG" | tail -3
+    $SUDO install -Dm644 -t "$fwdir" "$tmp"/WIFI_*.bin
+    rm -rf "$tmp"
+    ok "WiFi firmware installed to $fwdir."
+}
+
+# DKMS signs modules with this key; under Secure Boot it must be enrolled
+# (via MokManager on next boot) or the kernel will refuse to load them.
+# Done here rather than via the debconf dialog, which is hidden by the pipes.
+enroll_mok() {
+    local mok=/var/lib/shim-signed/mok/MOK.der
+    if ! mokutil --sb-state 2>/dev/null | grep -q 'SecureBoot enabled'; then
+        ok "Secure Boot disabled — no MOK enrollment needed."; return
+    fi
+    if [[ ! -f "$mok" ]]; then
+        warn "Secure Boot enabled but $mok missing — DKMS modules may not load."; return
+    fi
+    if mokutil --test-key "$mok" 2>&1 | grep -q 'already enrolled'; then
+        ok "DKMS signing key already enrolled."; return
+    fi
+    if $SUDO mokutil --list-new 2>/dev/null | grep -q .; then
+        ok "A MOK enrollment is already pending — confirm it at next boot."; return
+    fi
+    log "Secure Boot is enabled: enrolling the DKMS signing key."
+    echo "    Choose a one-time password (8–16 chars). You'll re-enter it at the"
+    echo "    blue MokManager screen on next boot: Enroll MOK → Continue → Yes."
+    $SUDO mokutil --import "$mok"
+    ok "MOK enrollment queued for next boot."
 }
 
 verify() {
@@ -246,6 +302,8 @@ main() {
     fetch_source
     build_deb
     install_deb
+    install_wifi_fw
+    enroll_mok
     verify
     post_install_notes
 }
